@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 
@@ -8,6 +9,7 @@
 
 #include <tesseron/error.hpp>
 #include <tesseron/json.hpp>
+#include <tesseron/protocol.hpp>
 
 namespace tesseron {
 
@@ -63,5 +65,11 @@ class Subscription {
 /// How a resource starts pushing. Registering one declares the resource
 /// subscribable in the manifest.
 using ResourceSubscriber = std::function<Subscription(ResourceEmitter)>;
+
+struct Resource {
+  ResourceDescriptor descriptor;
+  ResourceReader reader;
+  std::optional<ResourceSubscriber> subscriber;
+};
 
 }  // namespace tesseron

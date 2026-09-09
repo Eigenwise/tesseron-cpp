@@ -26,28 +26,15 @@ namespace tesseron::detail {
 
 class Session;
 
-struct RegisteredAction {
-  ActionDescriptor descriptor;
-  std::optional<InputValidator> validator;
-  ActionHandler handler;
-};
+using RegisteredAction = Action;
+using RegisteredResource = Resource;
 
-struct RegisteredResource {
-  ResourceDescriptor descriptor;
-  ResourceReader reader;
-  std::optional<ResourceSubscriber> subscriber;
-};
-
-/// Everything one host owns: what to announce, what to dispatch to, and what
-/// the last welcome established.
-///
-/// One I/O thread runs every connection, so the registries and the connection
-/// slot are read and written only from there. The negotiation snapshot is the
-/// exception, because `Host::welcome` answers on whatever thread the
-/// application asks from.
+/// Registry and connection snapshots share a lock because registration may run
+/// on application threads while the I/O thread installs a new session.
 struct HostState {
   ApplicationDescriptor application;
   Capabilities capabilities = Capabilities::implemented();
+  mutable std::mutex registry_guard;
   std::map<std::string, RegisteredAction> actions;
   std::vector<std::string> action_order;
   std::map<std::string, RegisteredResource> resources;

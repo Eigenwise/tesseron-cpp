@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tesseron/action.hpp>
@@ -86,6 +87,17 @@ class Host {
   /// user interface can read the current claim code and agent at any time.
   [[nodiscard]] std::optional<WelcomeResult> welcome() const;
 
+  /// Adds or replaces an action, keeping its announced position on replacement.
+  /// The live session receives the full list through actions/list_changed.
+  void register_action(Action action);
+  /// Adds or replaces a resource and announces the full resource list.
+  void register_resource(Resource resource);
+  /// Returns false without announcing anything when the name is unknown.
+  bool remove_action(std::string_view name);
+  /// Also ends this resource's live subscriptions and runs their teardowns.
+  /// Returns false without announcing anything when the name is unknown.
+  bool remove_resource(std::string_view name);
+
   /// Stops accepting, joins the I/O thread, then removes the instance
   /// manifest. Calling it twice is not an error.
   Result<void, HostError> shutdown();
@@ -95,6 +107,35 @@ class Host {
   explicit Host(std::shared_ptr<detail::HostState> state);
 
   std::shared_ptr<detail::HostState> state_;
+};
+
+/// Builds an Action value for Host::register_action; handler is the terminal step.
+class ActionDefinition {
+ public:
+  explicit ActionDefinition(std::string name);
+  ActionDefinition& description(std::string description);
+  ActionDefinition& input(Schema schema);
+  ActionDefinition& input_schema(Json schema, InputValidator validator);
+  ActionDefinition& output_schema(Json schema);
+  ActionDefinition& timeout(std::chrono::milliseconds timeout);
+  [[nodiscard]] Action handler(ActionHandler handler);
+
+ private:
+  ActionDescriptor descriptor_;
+  std::optional<InputValidator> validator_;
+};
+
+/// Builds a Resource value for Host::register_resource; reader is the terminal step.
+class ResourceDefinition {
+ public:
+  explicit ResourceDefinition(std::string name);
+  ResourceDefinition& description(std::string description);
+  ResourceDefinition& subscribe(ResourceSubscriber subscriber);
+  [[nodiscard]] Resource reader(ResourceReader reader);
+
+ private:
+  ResourceDescriptor descriptor_;
+  std::optional<ResourceSubscriber> subscriber_;
 };
 
 /// Collects one action's declaration. `handler` is the terminal step and hands
@@ -122,8 +163,7 @@ class ActionBuilder {
   ActionBuilder(HostBuilder& owner, std::string name);
 
   HostBuilder* owner_;
-  ActionDescriptor descriptor_;
-  std::optional<InputValidator> validator_;
+  ActionDefinition definition_;
 };
 
 /// Collects one resource's declaration. `reader` is the terminal step, so
@@ -142,8 +182,7 @@ class ResourceBuilder {
   ResourceBuilder(HostBuilder& owner, std::string name);
 
   HostBuilder* owner_;
-  ResourceDescriptor descriptor_;
-  std::optional<ResourceSubscriber> subscriber_;
+  ResourceDefinition definition_;
 };
 
 /// Collects an application definition, then starts serving it.

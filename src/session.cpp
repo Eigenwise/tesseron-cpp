@@ -93,7 +93,10 @@ Session::Session(WebSocketStream socket, std::shared_ptr<HostState> host)
 
 awaitable<void> Session::serve(WebSocketStream socket, std::shared_ptr<HostState> host) {
   const auto session = std::make_shared<Session>(std::move(socket), std::move(host));
-  session->host_->connection = session;
+  {
+    const std::lock_guard<std::mutex> guard(session->host_->registry_guard);
+    session->host_->connection = session;
+  }
   co_await session->run();
 }
 
@@ -109,6 +112,26 @@ void Session::dispatch_to_application(std::function<void()> work) {
 
 void Session::notify(std::string method, Json params) {
   send_envelope(notification(method, std::move(params)));
+}
+
+void Session::announce_actions_changed() {
+  if (!transport_open_ || handshake_ == Handshake::Failed) return;
+  if (handshake_ == Handshake::Pending) {
+    announce_actions_after_welcome_ = true;
+    return;
+  }
+  announce_actions_after_welcome_ = false;
+  notify(std::string(methods::kActionsListChanged), {{"actions", host_->action_descriptors()}});
+}
+
+void Session::announce_resources_changed() {
+  if (!transport_open_ || handshake_ == Handshake::Failed) return;
+  if (handshake_ == Handshake::Pending) {
+    announce_resources_after_welcome_ = true;
+    return;
+  }
+  announce_resources_after_welcome_ = false;
+  notify(std::string(methods::kResourcesListChanged), {{"resources", host_->resource_descriptors()}});
 }
 
 awaitable<Result<Json, ProtocolError>> Session::call(std::string method, Json params) {
@@ -312,8 +335,13 @@ void Session::start_invocation(const RequestId& id, const Json& params) {
     return;
   }
 
-  const auto action = host_->actions.find(*action_name);
-  if (action == host_->actions.end()) {
+  std::optional<Action> action;
+  {
+    const std::lock_guard<std::mutex> guard(host_->registry_guard);
+    const auto found = host_->actions.find(*action_name);
+    if (found != host_->actions.end()) action = found->second;
+  }
+  if (!action.has_value()) {
     send_envelope(failure(
         id, ProtocolError(TesseronErrorCode::ActionNotFound, "Action not found: " + *action_name)));
     return;
@@ -322,8 +350,8 @@ void Session::start_invocation(const RequestId& id, const Json& params) {
   const auto declared_input = params.find("input");
   Json input = declared_input == params.end() ? Json() : *declared_input;
 
-  if (action->second.validator.has_value()) {
-    const auto issues = (*action->second.validator)(input);
+  if (action->validator.has_value()) {
+    const auto issues = (*action->validator)(input);
     if (!issues.empty()) {
       send_envelope(failure(id, ProtocolError(TesseronErrorCode::InputValidation, "Invalid input")
                                     .with_data(validation_issues_to_json(issues))));
@@ -341,13 +369,13 @@ void Session::start_invocation(const RequestId& id, const Json& params) {
   auto running = std::make_shared<RunningInvocation>(executor_, state);
   invocations_.insert_or_assign(*invocation_id, running);
 
-  const auto declared_timeout = action->second.descriptor.timeout_milliseconds;
+  const auto declared_timeout = action->descriptor.timeout_milliseconds;
   const auto timeout = declared_timeout.has_value()
                            ? std::chrono::milliseconds(*declared_timeout)
                            : kDefaultInvocationTimeout;
   boost::asio::co_spawn(
       executor_,
-      run_invocation(id, std::move(running), action->second.handler, std::move(input), timeout),
+      run_invocation(id, std::move(running), action->handler, std::move(input), timeout),
       boost::asio::detached);
 }
 
@@ -451,13 +479,18 @@ void Session::start_resource_read(const RequestId& id, const Json& params) {
                                             "Invalid resources/read params: name is required")));
     return;
   }
-  const auto resource = host_->resources.find(*name);
-  if (resource == host_->resources.end()) {
+  std::optional<Resource> resource;
+  {
+    const std::lock_guard<std::mutex> guard(host_->registry_guard);
+    const auto found = host_->resources.find(*name);
+    if (found != host_->resources.end()) resource = found->second;
+  }
+  if (!resource.has_value()) {
     send_envelope(failure(
         id, ProtocolError(TesseronErrorCode::ActionNotFound, "Resource not readable: " + *name)));
     return;
   }
-  boost::asio::co_spawn(executor_, answer_resource_read(id, resource->second.reader),
+  boost::asio::co_spawn(executor_, answer_resource_read(id, resource->reader),
                         boost::asio::detached);
 }
 
@@ -489,8 +522,13 @@ void Session::subscribe_to_resource(const RequestId& id, const Json& params) {
     return;
   }
 
-  const auto resource = host_->resources.find(*name);
-  if (resource == host_->resources.end() || !resource->second.subscriber.has_value()) {
+  std::optional<Resource> resource;
+  {
+    const std::lock_guard<std::mutex> guard(host_->registry_guard);
+    const auto found = host_->resources.find(*name);
+    if (found != host_->resources.end()) resource = found->second;
+  }
+  if (!resource.has_value() || !resource->subscriber.has_value()) {
     send_envelope(failure(
         id, ProtocolError(TesseronErrorCode::ActionNotFound, "Resource not subscribable: " + *name)));
     return;
@@ -506,9 +544,9 @@ void Session::subscribe_to_resource(const RequestId& id, const Json& params) {
   state->subscription_id = *subscription_id;
 
   drop_subscription(*subscription_id);
-  auto subscription = (*resource->second.subscriber)(ResourceEmitter(state));
+  auto subscription = (*resource->subscriber)(ResourceEmitter(state));
   subscriptions_.insert_or_assign(*subscription_id,
-                                  RegisteredSubscription{std::move(state), std::move(subscription)});
+                                  RegisteredSubscription{*name, std::move(state), std::move(subscription)});
 }
 
 void Session::unsubscribe_from_resource(const RequestId& id, const Json& params) {
@@ -531,16 +569,25 @@ void Session::drop_subscription(const std::string& subscription_id) {
   auto registered = std::move(found->second);
   subscriptions_.erase(found);
   registered.state->active.store(false, std::memory_order_release);
-  registered.subscription.stop();
+  try {
+    registered.subscription.stop();
+  } catch (const std::exception& problem) {
+    std::cerr << "tesseron: a subscription teardown threw: " << problem.what() << std::endl;
+  } catch (...) {
+    std::cerr << "tesseron: a subscription teardown threw a value that is not an exception"
+              << std::endl;
+  }
+}
+
+void Session::drop_subscriptions_for(std::string_view resource) {
+  for (auto current = subscriptions_.begin(); current != subscriptions_.end();) {
+    const auto candidate = current++;
+    if (candidate->second.resource == resource) drop_subscription(candidate->first);
+  }
 }
 
 void Session::drop_all_subscriptions() {
-  auto registered = std::move(subscriptions_);
-  subscriptions_.clear();
-  for (auto& [subscription_id, subscription] : registered) {
-    subscription.state->active.store(false, std::memory_order_release);
-    subscription.subscription.stop();
-  }
+  while (!subscriptions_.empty()) drop_subscription(subscriptions_.begin()->first);
 }
 
 void Session::resolve(const RequestId& id, Result<Json, ProtocolError> outcome) {
@@ -624,6 +671,8 @@ void Session::accept_welcome(const Json& result) {
 
   host_->record_welcome(*welcome);
   settle_handshake(Handshake::Ready);
+  if (announce_actions_after_welcome_) announce_actions_changed();
+  if (announce_resources_after_welcome_) announce_resources_changed();
 
   HostEvent event;
   event.kind = HostEvent::Kind::Welcome;

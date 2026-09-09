@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   tesseron
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "C++ SDK for the Tesseron protocol"
   HOMEPAGE_URL "https://eigenwise.github.io/tesseron/"
   LANGUAGES CXX)

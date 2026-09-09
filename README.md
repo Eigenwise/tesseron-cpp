@@ -94,6 +94,33 @@ shape it cannot express there is `input_schema(Json, InputValidator)`, which
 takes the raw document *and* the check: an unenforced schema is a promise to
 the agent that the handler does not keep.
 
+## Registering at runtime
+
+After `listen()`, add or replace an action from any thread:
+
+```cpp
+host.register_action(tesseron::ActionDefinition("add_todo")
+    .description("Adds one todo")
+    .input(tesseron::schema::object({
+        tesseron::schema::required("title", tesseron::schema::string()),
+    }))
+    .handler(add_todo));
+
+bool removed = host.remove_action("add_todo");
+```
+
+`ResourceDefinition(name).reader(reader)` builds a resource for
+`host.register_resource(...)`; add `.subscribe(subscriber)` before `.reader(...)`
+for live updates. `host.remove_resource(name)` also ends that resource's active
+subscriptions and runs their teardowns.
+
+Registering an existing name replaces it without changing its list position.
+Removing an unknown name returns `false` and sends nothing. In-flight action
+calls finish using their original handler. The live session receives the full
+current list through `actions/list_changed` or `resources/list_changed`;
+changes during the handshake are announced after welcome. The next hello or
+resume also includes the current registry.
+
 ## Building it
 
 CMake 3.24 or newer, and a compiler with C++20 coroutines. Every dependency

@@ -54,6 +54,9 @@ class Session final : public GatewayChannel, public std::enable_shared_from_this
   /// Tears the connection down from outside its read loop, which is what
   /// `Host::shutdown` needs to stop the I/O thread.
   void close();
+  void announce_actions_changed();
+  void announce_resources_changed();
+  void drop_subscriptions_for(std::string_view resource);
 
  private:
   enum class Handshake { Pending, Ready, Failed };
@@ -84,6 +87,7 @@ class Session final : public GatewayChannel, public std::enable_shared_from_this
 
   /// One `resources/subscribe` the agent has not dropped yet.
   struct RegisteredSubscription {
+    std::string resource;
     std::shared_ptr<SubscriptionState> state;
     Subscription subscription;
   };
@@ -141,6 +145,8 @@ class Session final : public GatewayChannel, public std::enable_shared_from_this
   std::map<std::string, std::shared_ptr<PendingCall>> pending_;
 
   Handshake handshake_ = Handshake::Pending;
+  bool announce_actions_after_welcome_ = false;
+  bool announce_resources_after_welcome_ = false;
   boost::asio::steady_timer handshake_wake_;
 
   std::map<std::string, std::shared_ptr<RunningInvocation>> invocations_;

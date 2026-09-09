@@ -1,5 +1,6 @@
 #include <tesseron/host.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <sstream>
@@ -109,7 +110,7 @@ awaitable<void> serve_gateway_connection(boost::asio::ip::tcp::socket socket,
 }
 
 awaitable<void> accept_gateway_connections(std::shared_ptr<detail::HostState> host) {
-  while (true) {
+  while (!host->shut_down.load()) {
     boost::system::error_code failure;
     auto socket = co_await host->acceptor->async_accept(redirect_error(use_awaitable, failure));
     if (failure) {
@@ -132,6 +133,7 @@ awaitable<void> accept_gateway_connections(std::shared_ptr<detail::HostState> ho
 namespace detail {
 
 Json HostState::action_descriptors() const {
+  const std::lock_guard<std::mutex> guard(registry_guard);
   Json descriptors = Json::array();
   for (const auto& name : action_order) {
     const auto action = actions.find(name);
@@ -141,6 +143,7 @@ Json HostState::action_descriptors() const {
 }
 
 Json HostState::resource_descriptors() const {
+  const std::lock_guard<std::mutex> guard(registry_guard);
   Json descriptors = Json::array();
   for (const auto& name : resource_order) {
     const auto resource = resources.find(name);
@@ -274,61 +277,108 @@ ActionBuilder HostBuilder::action(std::string name) { return {*this, std::move(n
 
 ResourceBuilder HostBuilder::resource(std::string name) { return {*this, std::move(name)}; }
 
-ActionBuilder::ActionBuilder(HostBuilder& owner, std::string name) : owner_(&owner) {
+ActionDefinition::ActionDefinition(std::string name) {
   descriptor_.name = std::move(name);
 }
 
-ActionBuilder& ActionBuilder::description(std::string description) {
+ActionDefinition& ActionDefinition::description(std::string description) {
   descriptor_.description = std::move(description);
   return *this;
 }
 
-ActionBuilder& ActionBuilder::input(Schema schema) {
+ActionDefinition& ActionDefinition::input(Schema schema) {
   descriptor_.input_schema = schema.to_json();
   validator_ = [schema = std::move(schema)](const Json& input) { return schema.validate(input); };
   return *this;
 }
 
-ActionBuilder& ActionBuilder::input_schema(Json schema, InputValidator validator) {
+ActionDefinition& ActionDefinition::input_schema(Json schema, InputValidator validator) {
   descriptor_.input_schema = std::move(schema);
   validator_ = std::move(validator);
   return *this;
 }
 
-ActionBuilder& ActionBuilder::output_schema(Json schema) {
+ActionDefinition& ActionDefinition::output_schema(Json schema) {
   descriptor_.output_schema = std::move(schema);
   return *this;
 }
 
-ActionBuilder& ActionBuilder::timeout(std::chrono::milliseconds timeout) {
+ActionDefinition& ActionDefinition::timeout(std::chrono::milliseconds timeout) {
   descriptor_.timeout_milliseconds = static_cast<std::uint64_t>(timeout.count());
   return *this;
 }
 
-HostBuilder& ActionBuilder::handler(ActionHandler handler) {
-  owner_->definition_->actions.push_back(
-      detail::RegisteredAction{std::move(descriptor_), std::move(validator_), std::move(handler)});
-  return *owner_;
+Action ActionDefinition::handler(ActionHandler handler) {
+  return {std::move(descriptor_), std::move(validator_), std::move(handler)};
 }
 
-ResourceBuilder::ResourceBuilder(HostBuilder& owner, std::string name) : owner_(&owner) {
+ResourceDefinition::ResourceDefinition(std::string name) {
   descriptor_.name = std::move(name);
 }
 
-ResourceBuilder& ResourceBuilder::description(std::string description) {
+ResourceDefinition& ResourceDefinition::description(std::string description) {
   descriptor_.description = std::move(description);
   return *this;
 }
 
-ResourceBuilder& ResourceBuilder::subscribe(ResourceSubscriber subscriber) {
+ResourceDefinition& ResourceDefinition::subscribe(ResourceSubscriber subscriber) {
   descriptor_.subscribable = true;
   subscriber_ = std::move(subscriber);
   return *this;
 }
 
+Resource ResourceDefinition::reader(ResourceReader reader) {
+  return {std::move(descriptor_), std::move(reader), std::move(subscriber_)};
+}
+
+ActionBuilder::ActionBuilder(HostBuilder& owner, std::string name)
+    : owner_(&owner), definition_(std::move(name)) {}
+
+ActionBuilder& ActionBuilder::description(std::string description) {
+  definition_.description(std::move(description));
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::input(Schema schema) {
+  definition_.input(std::move(schema));
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::input_schema(Json schema, InputValidator validator) {
+  definition_.input_schema(std::move(schema), std::move(validator));
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::output_schema(Json schema) {
+  definition_.output_schema(std::move(schema));
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::timeout(std::chrono::milliseconds timeout) {
+  definition_.timeout(timeout);
+  return *this;
+}
+
+HostBuilder& ActionBuilder::handler(ActionHandler handler) {
+  owner_->definition_->actions.push_back(definition_.handler(std::move(handler)));
+  return *owner_;
+}
+
+ResourceBuilder::ResourceBuilder(HostBuilder& owner, std::string name)
+    : owner_(&owner), definition_(std::move(name)) {}
+
+ResourceBuilder& ResourceBuilder::description(std::string description) {
+  definition_.description(std::move(description));
+  return *this;
+}
+
+ResourceBuilder& ResourceBuilder::subscribe(ResourceSubscriber subscriber) {
+  definition_.subscribe(std::move(subscriber));
+  return *this;
+}
+
 HostBuilder& ResourceBuilder::reader(ResourceReader reader) {
-  owner_->definition_->resources.push_back(detail::RegisteredResource{
-      std::move(descriptor_), std::move(reader), std::move(subscriber_)});
+  owner_->definition_->resources.push_back(definition_.reader(std::move(reader)));
   return *owner_;
 }
 
@@ -356,21 +406,24 @@ Result<Host, HostError> HostBuilder::listen() {
   state->listener = definition_->listener;
   state->application_dispatcher = options.application_dispatcher;
 
-  for (auto& action : definition_->actions) {
-    const auto name = action.descriptor.name;
-    if (state->actions.count(name) != 0) {
-      return HostError(HostError::Kind::DuplicateName, "two actions are named \"" + name + "\"");
+  {
+    const std::lock_guard<std::mutex> guard(state->registry_guard);
+    for (auto& action : definition_->actions) {
+      const auto name = action.descriptor.name;
+      if (state->actions.count(name) != 0) {
+        return HostError(HostError::Kind::DuplicateName, "two actions are named \"" + name + "\"");
+      }
+      state->action_order.push_back(name);
+      state->actions.emplace(name, std::move(action));
     }
-    state->action_order.push_back(name);
-    state->actions.emplace(name, std::move(action));
-  }
-  for (auto& resource : definition_->resources) {
-    const auto name = resource.descriptor.name;
-    if (state->resources.count(name) != 0) {
-      return HostError(HostError::Kind::DuplicateName, "two resources are named \"" + name + "\"");
+    for (auto& resource : definition_->resources) {
+      const auto name = resource.descriptor.name;
+      if (state->resources.count(name) != 0) {
+        return HostError(HostError::Kind::DuplicateName, "two resources are named \"" + name + "\"");
+      }
+      state->resource_order.push_back(name);
+      state->resources.emplace(name, std::move(resource));
     }
-    state->resource_order.push_back(name);
-    state->resources.emplace(name, std::move(resource));
   }
 
   boost::system::error_code failure;
@@ -463,6 +516,67 @@ std::optional<std::filesystem::path> Host::instance_manifest_path() const {
 
 std::optional<WelcomeResult> Host::welcome() const { return state_->welcome_snapshot(); }
 
+void Host::register_action(Action action) {
+  std::shared_ptr<detail::Session> session;
+  {
+    const std::lock_guard<std::mutex> guard(state_->registry_guard);
+    const auto name = action.descriptor.name;
+    if (state_->actions.count(name) == 0) state_->action_order.push_back(name);
+    state_->actions.insert_or_assign(name, std::move(action));
+    session = state_->connection.lock();
+  }
+  if (session) {
+    boost::asio::post(session->executor(), [session] { session->announce_actions_changed(); });
+  }
+}
+
+bool Host::remove_action(std::string_view name) {
+  const std::string registered_name(name);
+  std::shared_ptr<detail::Session> session;
+  {
+    const std::lock_guard<std::mutex> guard(state_->registry_guard);
+    if (state_->actions.erase(registered_name) == 0) return false;
+    std::erase(state_->action_order, registered_name);
+    session = state_->connection.lock();
+  }
+  if (session) {
+    boost::asio::post(session->executor(), [session] { session->announce_actions_changed(); });
+  }
+  return true;
+}
+
+void Host::register_resource(Resource resource) {
+  std::shared_ptr<detail::Session> session;
+  {
+    const std::lock_guard<std::mutex> guard(state_->registry_guard);
+    const auto name = resource.descriptor.name;
+    if (state_->resources.count(name) == 0) state_->resource_order.push_back(name);
+    state_->resources.insert_or_assign(name, std::move(resource));
+    session = state_->connection.lock();
+  }
+  if (session) {
+    boost::asio::post(session->executor(), [session] { session->announce_resources_changed(); });
+  }
+}
+
+bool Host::remove_resource(std::string_view name) {
+  const std::string registered_name(name);
+  std::shared_ptr<detail::Session> session;
+  {
+    const std::lock_guard<std::mutex> guard(state_->registry_guard);
+    if (state_->resources.erase(registered_name) == 0) return false;
+    std::erase(state_->resource_order, registered_name);
+    session = state_->connection.lock();
+  }
+  if (session) {
+    boost::asio::post(session->executor(), [session, registered_name] {
+      session->drop_subscriptions_for(registered_name);
+    });
+    boost::asio::post(session->executor(), [session] { session->announce_resources_changed(); });
+  }
+  return true;
+}
+
 Result<void, HostError> Host::shutdown() {
   if (!state_) return Result<void, HostError>::success();
   if (state_->shut_down.exchange(true)) return Result<void, HostError>::success();
@@ -470,7 +584,12 @@ Result<void, HostError> Host::shutdown() {
   boost::asio::post(state_->io_context, [state = state_] {
     boost::system::error_code ignored;
     if (state->acceptor.has_value()) state->acceptor->close(ignored);
-    if (const auto connection = state->connection.lock()) connection->close();
+    std::shared_ptr<detail::Session> connection;
+    {
+      const std::lock_guard<std::mutex> guard(state->registry_guard);
+      connection = state->connection.lock();
+    }
+    if (connection) connection->close();
   });
   state_->work_guard.reset();
   if (state_->io_thread.joinable()) state_->io_thread.join();

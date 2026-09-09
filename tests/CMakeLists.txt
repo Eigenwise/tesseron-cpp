@@ -25,6 +25,7 @@ add_executable(
   framing_test.cpp
   gateway_double.cpp
   handshake_test.cpp
+  runtime_registration_test.cpp
   progress_test.cpp
   subscription_test.cpp)
 
